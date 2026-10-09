@@ -127,8 +127,12 @@ function combine(acc, pre, values, maxLength, dropEmpties) {
 }
 
 // The expansion values of a single numeric (`1..5`) or alphabetic (`a..e..2`)
-// sequence body.
-function expandSequence(body, isAlphaSequence) {
+// sequence body. `maxLength` bounds the total number of characters generated
+// here: a padded sequence's element width follows the input, so building every
+// element before `combine` could discard them cost time and memory
+// proportional to the sequence length times that width - a ~400KB input
+// blocked the event loop for minutes (CVE-2026-69152).
+function expandSequence(body, isAlphaSequence, maxLength) {
   var n = body.split(/\.\./);
   var N = [];
   var x = numeric(n[0]);
@@ -145,6 +149,7 @@ function expandSequence(body, isAlphaSequence) {
   }
   var pad = n.some(isPadded);
 
+  var length = 0;
   for (var i = x; test(i, y); i += incr) {
     var c;
     if (isAlphaSequence) {
@@ -164,7 +169,9 @@ function expandSequence(body, isAlphaSequence) {
         }
       }
     }
+    if (length + c.length > maxLength) break;
     N.push(c);
+    length += c.length;
   }
   return N;
 }
@@ -239,7 +246,7 @@ function expand(str, maxLength, isTop) {
 
     var values;
     if (isSequence) {
-      values = expandSequence(m.body, isAlphaSequence);
+      values = expandSequence(m.body, isAlphaSequence, maxLength);
     } else {
       var n = parseCommaParts(m.body);
       if (n.length === 1) {
@@ -259,9 +266,27 @@ function expand(str, maxLength, isTop) {
         }
       }
 
+      // Each alternative is expanded on its own, so `maxLength` bounded only
+      // that alternative's own output - never the running total accumulated
+      // across all of them. Many alternatives, each individually far under
+      // `maxLength`, could still sum to an unbounded intermediate array before
+      // the final `combine` call ever got a chance to truncate it
+      // (CVE-2026-69152). Carrying `valuesLength` across the alternatives
+      // keeps the intermediate array bounded too. `combine` can only consume
+      // fewer characters than are kept here - every result it builds is at
+      // least as long as the value it comes from - so the output is unchanged.
       values = [];
-      for (var j = 0; j < n.length; j++) {
-        values.push.apply(values, expand(n[j], maxLength, false));
+      var valuesLength = 0;
+      outer: for (var j = 0; j < n.length; j++) {
+        var expanded = expand(n[j], maxLength, false);
+        for (var k = 0; k < expanded.length; k++) {
+          var v = expanded[k];
+          if (valuesLength + v.length > maxLength) {
+            break outer;
+          }
+          values.push(v);
+          valuesLength += v.length;
+        }
       }
     }
 
