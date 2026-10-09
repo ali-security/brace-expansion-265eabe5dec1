@@ -28,6 +28,16 @@ var EXPANSION_MAX_LENGTH = 4000000;
 // the depth at which the stack runs out.
 var EXPANSION_MAX_DEPTH = 1000;
 
+// Bash keeps a quirk where a brace group followed by a comma set still expands
+// (`{a},b}`). The parser implements it by rewriting the string and restarting
+// the scan, absorbing one `}` per pass. `n` trailing braces therefore cost `n`
+// full passes over a string that itself grows by one `escClose` sentinel each
+// time - quadratic in `n`, with a ~26x constant from the sentinel's length.
+// 128KB of `'{a}' + '}'.repeat(n) + ',z}'` blocked the event loop for 27
+// seconds to produce two results. `EXPANSION_MAX_REWRITES` bounds how many
+// times the scan may restart. Real `{a},b}` input needs a handful.
+var EXPANSION_MAX_REWRITES = 1000;
+
 function numeric(str) {
   return parseInt(str, 10) == str
     ? parseInt(str, 10)
@@ -111,6 +121,9 @@ function expandTop(str, options) {
   var maxDepth = (options && options.maxDepth !== undefined)
     ? options.maxDepth
     : EXPANSION_MAX_DEPTH;
+  var maxRewrites = (options && options.maxRewrites !== undefined)
+    ? options.maxRewrites
+    : EXPANSION_MAX_REWRITES;
 
   // I don't know why Bash 4.3 does this, but it does.
   // Anything starting with {} will have the first two bytes preserved
@@ -122,7 +135,7 @@ function expandTop(str, options) {
     str = '\\{\\}' + str.substr(2);
   }
 
-  return expand(escapeBraces(str), maxLength, maxDepth, 0, true).map(unescapeBraces);
+  return expand(escapeBraces(str), maxLength, maxDepth, 0, maxRewrites, true).map(unescapeBraces);
 }
 
 function embrace(str) {
@@ -209,7 +222,7 @@ function expandSequence(body, isAlphaSequence, maxLength) {
   return N;
 }
 
-function expand(str, maxLength, maxDepth, depth, isTop) {
+function expand(str, maxLength, maxDepth, depth, maxRewrites, isTop) {
   // Too deeply nested to keep following: treat the rest as literal, the same
   // way a group that cannot expand is already handled. Truncating rather than
   // throwing keeps expansion total, matching `maxLength`.
@@ -229,6 +242,9 @@ function expand(str, maxLength, maxDepth, depth, isTop) {
   // comma set - a sequence like `{a..\}` may legitimately yield ''. The drop
   // is on the final strings, so it is applied to whichever `combine` produces
   // them (the one with no brace set left in the tail).
+  // How many times the `{a},b}` rewrite below has restarted the scan. Each pass
+  // re-reads the whole string, so leaving this unbounded is quadratic.
+  var rewrites = 0;
   var dropEmpties = false;
   var firstGroup = true;
 
@@ -264,7 +280,8 @@ function expand(str, maxLength, maxDepth, depth, isTop) {
     var isOptions = m.body.indexOf(',') >= 0;
     if (!isSequence && !isOptions) {
       // {a},b}
-      if (m.post.match(/,(?!,).*\}/)) {
+      if (rewrites < maxRewrites && m.post.match(/,(?!,).*\}/)) {
+        rewrites++;
         str = m.pre + '{' + m.body + escClose + m.post;
         isTop = false;
         continue;
@@ -291,7 +308,7 @@ function expand(str, maxLength, maxDepth, depth, isTop) {
       var n = parseCommaParts(m.body);
       if (n.length === 1) {
         // x{{a,b}}y ==> x{a}y x{b}y
-        n = expand(n[0], maxLength, maxDepth, depth + 1, false).map(embrace);
+        n = expand(n[0], maxLength, maxDepth, depth + 1, maxRewrites, false).map(embrace);
         if (n.length === 1) {
           acc = combine(
             acc,
@@ -318,7 +335,7 @@ function expand(str, maxLength, maxDepth, depth, isTop) {
       values = [];
       var valuesLength = 0;
       outer: for (var j = 0; j < n.length; j++) {
-        var expanded = expand(n[j], maxLength, maxDepth, depth + 1, false);
+        var expanded = expand(n[j], maxLength, maxDepth, depth + 1, maxRewrites, false);
         for (var k = 0; k < expanded.length; k++) {
           var v = expanded[k];
           if (valuesLength + v.length > maxLength) {
