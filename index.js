@@ -18,6 +18,16 @@ var escPeriod = '\0PERIOD'+Math.random()+'\0';
 // any realistic expansion so legitimate input is unaffected.
 var EXPANSION_MAX_LENGTH = 4000000;
 
+// `expand` recurses once per level of brace *nesting* - both when expanding a
+// set's comma members and when re-wrapping a set whose body is a single part.
+// The CVE-2026-14257 fix made the *tail* iterative (recursion on `m.post`, one
+// level per chained group), which left nesting depth unbounded: about 3,100
+// levels of `{{{...a,b...}}}` - only ~6KB of input - exhausted the native stack
+// and crashed the process. `EXPANSION_MAX_DEPTH` bounds how deep the parser
+// will follow nesting. It sits far above any realistic pattern and well below
+// the depth at which the stack runs out.
+var EXPANSION_MAX_DEPTH = 1000;
+
 function numeric(str) {
   return parseInt(str, 10) == str
     ? parseInt(str, 10)
@@ -98,6 +108,9 @@ function expandTop(str, options) {
   var maxLength = (options && options.maxLength !== undefined)
     ? options.maxLength
     : EXPANSION_MAX_LENGTH;
+  var maxDepth = (options && options.maxDepth !== undefined)
+    ? options.maxDepth
+    : EXPANSION_MAX_DEPTH;
 
   // I don't know why Bash 4.3 does this, but it does.
   // Anything starting with {} will have the first two bytes preserved
@@ -109,7 +122,7 @@ function expandTop(str, options) {
     str = '\\{\\}' + str.substr(2);
   }
 
-  return expand(escapeBraces(str), maxLength, true).map(unescapeBraces);
+  return expand(escapeBraces(str), maxLength, maxDepth, 0, true).map(unescapeBraces);
 }
 
 function embrace(str) {
@@ -196,7 +209,14 @@ function expandSequence(body, isAlphaSequence, maxLength) {
   return N;
 }
 
-function expand(str, maxLength, isTop) {
+function expand(str, maxLength, maxDepth, depth, isTop) {
+  // Too deeply nested to keep following: treat the rest as literal, the same
+  // way a group that cannot expand is already handled. Truncating rather than
+  // throwing keeps expansion total, matching `maxLength`.
+  if (depth > maxDepth) {
+    return [str];
+  }
+
   // Consume the string's top-level brace groups left to right, threading a
   // running set of combined prefixes (`acc`). Expanding the tail iteratively -
   // rather than recursing on `m.post` once per group - keeps the native stack
@@ -271,7 +291,7 @@ function expand(str, maxLength, isTop) {
       var n = parseCommaParts(m.body);
       if (n.length === 1) {
         // x{{a,b}}y ==> x{a}y x{b}y
-        n = expand(n[0], maxLength, false).map(embrace);
+        n = expand(n[0], maxLength, maxDepth, depth + 1, false).map(embrace);
         if (n.length === 1) {
           acc = combine(
             acc,
@@ -298,7 +318,7 @@ function expand(str, maxLength, isTop) {
       values = [];
       var valuesLength = 0;
       outer: for (var j = 0; j < n.length; j++) {
-        var expanded = expand(n[j], maxLength, false);
+        var expanded = expand(n[j], maxLength, maxDepth, depth + 1, false);
         for (var k = 0; k < expanded.length; k++) {
           var v = expanded[k];
           if (valuesLength + v.length > maxLength) {
